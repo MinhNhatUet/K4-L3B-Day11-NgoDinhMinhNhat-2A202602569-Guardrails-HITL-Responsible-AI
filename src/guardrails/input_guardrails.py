@@ -17,10 +17,20 @@ from google.genai import types
 from google.adk.plugins import base_plugin
 from google.adk.agents.invocation_context import InvocationContext
 
+import unicodedata
+
+from agents.security_boundary import normalize_for_security
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+
+def _fold(text: str) -> str:
+    """Lowercase, strip Vietnamese diacritics, collapse whitespace."""
+    text = unicodedata.normalize("NFD", text.replace("đ", "d").replace("Đ", "D"))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", text).lower()
 
 
 # ============================================================
@@ -52,13 +62,20 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"\b(ignore|disregard|forget|override)\s+(all\s+)?(the\s+)?(previous|prior|above|earlier|your|system)?\s*(instructions|rules|prompts?|guidelines)",
+        r"\byou\s+are\s+now\b",
+        r"\bsystem\s+prompt\b",
+        r"\breveal\s+(your|the)\s+(system\s+)?(instructions|prompt|rules|config)",
+        r"\bpretend\s+(you\s+are|to\s+be)\b",
+        r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|dan)\b",
+        r"\b(jailbreak|developer\s+mode|dan\s+mode)\b",
+        r"\b(bo\s+qua|phot\s+lo)\s+(moi\s+|tat\s+ca\s+)?(huong\s+dan|chi\s+dan|lenh)",
     ]
 
+    # NFKC + strip zero-width chars, collapse whitespace, drop Vietnamese accents
+    text = _fold(normalize_for_security(user_input))
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, text, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +101,17 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = _fold(normalize_for_security(user_input))
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def has(terms):
+        # leading \b only, so plurals/inflections still match ("loans", "hacking")
+        return any(re.search(r"\b" + re.escape(t), input_lower) for t in terms)
 
-    pass  # Replace with your implementation
+    if has(BLOCKED_TOPICS):
+        return "BLOCK"
+    if not has(ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +164,19 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
-
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Your request was blocked: it looks like an attempt to override "
+                "the assistant's instructions. I can only help with VinBank banking questions."
+            )
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Sorry, I can only help with VinBank banking topics such as accounts, "
+                "transfers, savings, loans, interest rates and credit cards."
+            )
+        return None
 
 
 # ============================================================

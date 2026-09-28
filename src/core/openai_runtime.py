@@ -62,7 +62,8 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
+        completion = _create_with_rate_limit_retry(
+            client,
             model=self.model,
             messages=[
                 {"role": "system", "content": agent.instruction},
@@ -138,6 +139,37 @@ class OpenAIRunner:
             if out is not None and getattr(out, "content", None) is not None:
                 llm_response = out
         return _content_to_text(llm_response.content) or text
+
+
+def _create_with_rate_limit_retry(client, attempts: int = 6, **kwargs):
+    """chat.completions.create that survives OpenRouter free-tier 429s / stalls.
+
+    OpenRouter puts Retry-After in the JSON body (error.metadata), not the HTTP
+    header, so the SDK's own backoff (max 8s) gives up before the 60s window ends.
+    Free-pool requests can also hang for minutes, so cap each try at 90s.
+    """
+    import time
+    from openai import APIConnectionError, InternalServerError, RateLimitError
+
+    kwargs.setdefault("timeout", 90)
+    for attempt in range(attempts):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except (RateLimitError, APIConnectionError, InternalServerError) as e:
+            # APITimeoutError is a subclass of APIConnectionError
+            if attempt == attempts - 1:
+                raise
+            body = getattr(e, "body", None)
+            body = body if isinstance(body, dict) else {}
+            meta = body.get("metadata") or (body.get("error") or {}).get("metadata") or {}
+            if "daily" in str(meta.get("limit_source", "")):
+                raise  # daily quota: waiting seconds won't help, fail fast
+            retry_after = meta.get("retry_after_seconds")
+            wait = (60.0 if retry_after is None else float(retry_after)) + 1
+            if not isinstance(e, RateLimitError):
+                wait = 5.0
+            print(f"  ({type(e).__name__} - waiting {wait:.0f}s, retry {attempt + 1}/{attempts - 1})")
+            time.sleep(wait)
 
 
 def _content_to_text(content: Any) -> str:
